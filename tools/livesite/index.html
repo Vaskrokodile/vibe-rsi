@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xera-rsi · live</title>
+<style>
+  :root {
+    --bg: #07090f;
+    --panel: #0d1117;
+    --panel2: #111826;
+    --border: #1e293b;
+    --text: #e2e8f0;
+    --dim: #64748b;
+    --accent: #22d3ee;
+    --green: #4ade80;
+    --blue: #60a5fa;
+    --purple: #a78bfa;
+    --orange: #fb923c;
+    --yellow: #facc15;
+    --pink: #f472b6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.5 "SF Mono", ui-monospace, Menlo, monospace;
+    overflow: hidden;
+  }
+  #topbar {
+    height: 46px; display: flex; align-items: center; gap: 16px;
+    padding: 0 16px; border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #topbar .logo { font-weight: 700; letter-spacing: 1px; }
+  #topbar .logo b { color: var(--accent); }
+  .tab {
+    padding: 5px 14px; border-radius: 6px; cursor: pointer;
+    color: var(--dim); border: 1px solid transparent; user-select: none;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.on { color: var(--accent); border-color: var(--accent); background: #0a1a20; }
+  #livepill {
+    margin-left: auto; display: flex; align-items: center; gap: 7px;
+    color: var(--dim); font-size: 12px;
+  }
+  #livedot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+    box-shadow: 0 0 8px var(--green); animation: pulse 1.6s infinite;
+  }
+  @keyframes pulse { 50% { opacity: .3; } }
+  #main { display: flex; height: calc(100% - 46px); }
+
+  /* ---- left sidebar ---- */
+  #sidebar {
+    width: 240px; min-width: 240px; border-right: 1px solid var(--border);
+    background: var(--panel); overflow-y: auto; padding: 10px;
+  }
+  #sidebar h3 { font-size: 11px; color: var(--dim); text-transform: uppercase;
+    letter-spacing: 1px; margin: 8px 4px; }
+  .sess {
+    padding: 8px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 4px;
+    border: 1px solid transparent;
+  }
+  .sess:hover { background: var(--panel2); }
+  .sess.on { border-color: var(--border); background: var(--panel2); }
+  .sess .sid { color: var(--accent); font-size: 12px; }
+  .sess .smeta { color: var(--dim); font-size: 11px; margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess.live::before { content: "●"; color: var(--green); margin-right: 5px; font-size: 9px; }
+
+  /* ---- 3d canvas ---- */
+  #stage { flex: 1; position: relative; min-width: 0; }
+  #c3d { position: absolute; inset: 0; }
+  #legend {
+    position: absolute; left: 12px; bottom: 12px; background: #0d1117cc;
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    font-size: 11px; backdrop-filter: blur(4px);
+  }
+  #legend .li { display: flex; align-items: center; gap: 8px; margin: 2px 0; color: var(--dim); }
+  #legend .dot { width: 9px; height: 9px; border-radius: 50%; }
+  #hint {
+    position: absolute; top: 12px; left: 12px; color: var(--dim); font-size: 11px;
+    background: #0d1117aa; padding: 6px 10px; border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+
+  /* ---- detail panel ---- */
+  #detail {
+    position: absolute; right: 12px; top: 12px; width: 380px; max-height: calc(100% - 24px);
+    overflow-y: auto; background: #0d1117ee; border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px; display: none; backdrop-filter: blur(6px);
+  }
+  #detail .dhead { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  #detail .dtype { font-size: 11px; padding: 2px 9px; border-radius: 10px; font-weight: 700; }
+  #detail .dtime { color: var(--dim); font-size: 11px; margin-left: auto; }
+  #detail .dclose { cursor: pointer; color: var(--dim); }
+  #detail .dclose:hover { color: var(--text); }
+  #detail pre {
+    white-space: pre-wrap; word-break: break-word; font-size: 12px;
+    color: var(--text); max-height: 60vh; overflow-y: auto;
+  }
+  #detail .dmeta { color: var(--dim); font-size: 11px; margin-top: 8px; }
+
+  /* ---- stats view ---- */
+  #stats {
+    position: absolute; inset: 0; overflow-y: auto; padding: 24px 32px;
+    display: none; background: var(--bg);
+  }
+  #stats h2 { font-size: 15px; margin: 22px 0 10px; color: var(--accent); }
+  .cards { display: flex; flex-wrap: wrap; gap: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 18px; min-width: 160px;
+  }
+  .card .v { font-size: 24px; font-weight: 700; }
+  .card .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  .card.gold .v { color: var(--yellow); }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--dim); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  td { color: var(--text); }
+  .bar-wrap { display: flex; align-items: center; gap: 10px; margin: 4px 0; font-size: 12px; }
+  .bar-wrap .blabel { width: 130px; color: var(--dim); text-align: right;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar { height: 14px; border-radius: 3px; background: var(--accent); min-width: 2px; }
+  .lesson {
+    border-left: 3px solid var(--yellow); padding: 8px 12px; margin: 8px 0;
+    background: var(--panel); border-radius: 0 8px 8px 0; font-size: 12px;
+  }
+  .lesson .lts { color: var(--dim); font-size: 11px; }
+  #toast {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: var(--panel2); border: 1px solid var(--border); padding: 8px 16px;
+    border-radius: 8px; font-size: 12px; display: none; z-index: 9;
+  }
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <div class="logo"><b>⬡</b> xera-rsi <span style="color:var(--dim)">live</span></div>
+    <div class="tab on" id="tab-net">neural map</div>
+    <div class="tab" id="tab-stats">statistics</div>
+    <div id="livepill"><div id="livedot"></div><span id="livetext">live</span></div>
+  </div>
+  <div id="main">
+    <div id="sidebar">
+      <h3>sessions</h3>
+      <div id="sesslist"></div>
+    </div>
+    <div id="stage">
+      <canvas id="c3d"></canvas>
+      <div id="hint">drag orbit · scroll zoom · click node for detail</div>
+      <div id="legend"></div>
+      <div id="detail"></div>
+    </div>
+    <div id="stats"></div>
+  </div>
+  <div id="toast"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

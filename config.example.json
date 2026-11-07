@@ -1,0 +1,9 @@
+{
+  "base_url": "https://api.openai.com/v1",
+  "api_key_env": "OPENAI_API_KEY",
+  "model": "gpt-5",
+  "max_tokens": 16384,
+  "approval": "ask",
+  "stream": true,
+  "max_iters": 60
+}

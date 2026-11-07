@@ -1,0 +1,9 @@
+pty_log.txt
+zig-out/
+.zig-cache/
+test_ws/
+__pycache__/
+mptest_bin
+
+
+*.log
