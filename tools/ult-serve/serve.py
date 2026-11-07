@@ -1,48 +1,55 @@
 #!/usr/bin/env python3
 """ult-serve — OpenAI-compatible endpoint for the ULT (GA106) engine.
 
-Bridges xera-rsi's OpenAI chat-completions client to the megakernel:
-  GET  /v1/models             -> loaded model (+ any other profiles)
-  GET  /health                -> {"status":"ok"}
-  POST /v1/chat/completions   -> per-model template render -> Engine
-                                 (SSE streaming from the mapped token
-                                 counter mid-kernel — same mechanics as
-                                 GA106's chat.py, including the
-                                 drain/reset/prefill/reset order)
+Architecture (changed after a deadlock took down a desktop GPU):
 
-What this adds over the engine's own serve.py, for agent use:
-  - reads max_completion_tokens (xera-rsi sends that field first)
-  - injects tool schemas and parses <tool_call>{...}</tool_call> output
-    back into OpenAI tool_calls (small models: best-effort)
-  - splits R1/LFM3 <think>...</think> into reasoning_content, so the
-    harness shows reasoning separately
-  - --tools-limit caps the injected schema list (prompt size ↔ speed)
+  serve.py (dispatcher, --port 8321)
+    |- serve.py --worker qwen --port <ephemeral>   (own CUDA context)
+    |- serve.py --worker lfm3 --port <ephemeral>   (own CUDA context)
 
-Run:
-  python serve.py --model qwen --port 8000
-  python serve.py --model lfm3 --port 8000
+Why per-model subprocesses: a deadlocked persistent kernel spins all SMs
+forever and CANNOT be preempted — only destroying its CUDA context
+(killing the process) frees the GPU. In-process retries stack zombies and
+hang the display (WDDM TDR). A worker that stalls exits itself; the
+dispatcher respawns it with a fresh context. Stalls/corruption in one
+model can never poison the other.
 
-Env: GA106_HOME (engine source tree, default E:/GA106),
-     ULT_QUANT (default q4), GA106_LFM3_VARIANT (default ult_exact).
+Endpoints (dispatcher):
+  GET  /health                -> {"status":"ok","models":{...}}
+  GET  /v1/models             -> configured model ids
+  POST /v1/chat/completions   -> proxied to the model's worker
+
+Worker-only internals mirror GA106 chat.py: drain the orphan kernel,
+reset mapped counters after prefill (stale-slot bug), sequential prefill,
+single decode launch, poll the mapped token counter, stream SSE.
+
+Env: GA106_HOME (default E:/GA106), ULT_QUANT (default q4),
+     GA106_LFM3_VARIANT (q4|ult_exact|ult_hfma, default ult_exact),
+     GA106_LFM3_BATCHED_PREFILL=1 to enable LFM3 batched prefill,
+     ULT_MAX_GEN (cap on generated tokens, default 1024 — the kernel
+     always fills ntok slots even after EOS, so uncapped requests burn
+     GPU for nothing),
+     ULT_GEN_TIMEOUT (per-request wall clock, default 300s).
 """
 import json
 import os
 import sys
 import time
-import queue
+import socket
 import threading
+import subprocess
 import argparse
+import http.client
+import atexit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 GA106 = os.environ.get("GA106_HOME", r"E:\GA106")
 sys.path.insert(0, GA106)
 
-from tokenizers import Tokenizer           # noqa: E402
-from ga106.engine import Engine            # noqa: E402
-from ga106.engine_lfm3 import EngineLFM3   # noqa: E402
-from ga106 import cuda as _c               # noqa: E402
-
 MAXPOS = 8192
+MAX_GEN = int(os.environ.get("ULT_MAX_GEN", "1024"))
+GEN_TIMEOUT = float(os.environ.get("ULT_GEN_TIMEOUT", "300"))
+WORKER_READY_TIMEOUT = float(os.environ.get("ULT_WORKER_READY", "420"))
 _lock = threading.Lock()          # one persistent kernel at a time
 
 PROFILES = {
@@ -51,38 +58,45 @@ PROFILES = {
         "tok": r"E:\DeepSeek-R1-Distill-Qwen-1.5B\tokenizer.json",
         "eos": 151643,
         "template": "r1",
-        "engine": lambda: Engine(
-            os.path.join(GA106, r"models\qwen1.5b\model.safetensors"),
-            quant=os.environ.get("GA106_QUANT", "q4")),
     },
     "lfm3": {
         "name": "ult-lfm3-1.7b",
         "tok": os.path.join(GA106, r"models\lfm3-1.7b\tokenizer.json"),
         "eos": 124900,
         "template": "chatml",
-        "engine": None,          # filled in main() (needs variant env)
     },
 }
 
-
-def lfm3_engine():
-    variant = os.environ.get("GA106_LFM3_VARIANT", "ult_exact")
-    model = os.path.join(GA106, r"models\lfm3-1.7b\model.safetensors")
-    ult = os.path.join(GA106, r"kernels\lfm3.ult")
-    if variant == "q4":
-        return EngineLFM3(model, quant="q4")
-    if variant == "ult_exact":
-        return EngineLFM3.from_ult(model, ult,
-                                   options={"fuse_conv_o": 1,
-                                            "threads": 384})
-    if variant == "ult_hfma":
-        return EngineLFM3.from_ult(model, ult,
-                                   options={"hfma": 1, "fuse_conv_o": 1,
-                                            "threads": 384})
-    raise ValueError("GA106_LFM3_VARIANT must be q4|ult_exact|ult_hfma")
+def log(*a):
+    try:
+        print(*a, file=sys.stderr, flush=True)
+    except OSError:
+        pass
 
 
-PROFILES["lfm3"]["engine"] = lfm3_engine
+def make_engine(name):
+    if name == "qwen":
+        from ga106.engine import Engine
+        return Engine(os.path.join(GA106, r"models\qwen1.5b\model.safetensors"),
+                      quant=os.environ.get("GA106_QUANT", "q4"))
+    if name == "lfm3":
+        from ga106.engine_lfm3 import EngineLFM3
+        variant = os.environ.get("GA106_LFM3_VARIANT", "ult_exact")
+        model = os.path.join(GA106, r"models\lfm3-1.7b\model.safetensors")
+        ult = os.path.join(GA106, r"kernels\lfm3.ult")
+        if variant == "q4":
+            return EngineLFM3(model, quant="q4")
+        if variant == "ult_hfma":
+            return EngineLFM3.from_ult(model, ult,
+                                       options={"hfma": 1, "fuse_conv_o": 1,
+                                                "threads": 384})
+        if variant == "ult_exact":
+            return EngineLFM3.from_ult(model, ult,
+                                       options={"fuse_conv_o": 1,
+                                                "threads": 384})
+        raise ValueError("GA106_LFM3_VARIANT must be q4|ult_exact|ult_hfma")
+    raise ValueError(f"unknown engine '{name}'")
+
 
 # ---------- templates (mirrors GA106 chat.py) ----------
 
@@ -189,107 +203,112 @@ def split_think(text):
     return "", text.strip()
 
 
-# ---------- engine mechanics (from GA106 chat.py — do not reorder) ----------
+# ================= worker (single engine, own CUDA context) =================
 
-def generate(profile, tok, eng, ids_in, ntok, on_tok=None):
-    """Prefill sequentially, then one decode launch; polls the mapped
-    token counter. on_tok(list-of-new-ids) fires as tokens land.
-    Returns (generated_ids, elapsed_s)."""
-    eos_id = profile["eos"]
-    with _lock:
-        # drain any orphan kernel from a disconnected request — it keeps
-        # writing tokens[] while running
-        t_drain = time.perf_counter()
-        while not _c.stream_query(eng.stream):
-            if time.perf_counter() - t_drain > 30:
-                raise TimeoutError("previous generation still active")
-            time.sleep(0.001)
-        eng._tok_host[0] = 0
-        eng._tok_host[8192 + 4] = -1
-        _c.memset_dev(eng.d_bar, 0, 64)
-        _c.memset_dev(eng.d_plog, 0, (4 * 56 + 64 + 4096) * 4)
-        _c.sync()
+def run_worker(model_name, host, port, tools_limit):
+    """Load one engine and serve /v1 for it. On any kernel stall we
+    os._exit — the deadlocked kernel can only be killed by destroying
+    the CUDA context, and the dispatcher will respawn us cleanly."""
+    from tokenizers import Tokenizer
+    from ga106 import cuda as _c
 
-        for i, tk in enumerate(ids_in[:-1]):
-            eng._launch(tk, i, 1)
-            eng._wait()
+    profile = PROFILES[model_name]
+    model_id = profile["name"]
 
-        # prefill launches bump tokens[0]/[1] — reset so the poll only
-        # counts DECODE tokens (the stale-slot bug chat.py documents)
-        eng._tok_host[0] = 0
-        _c.sync()
-
-        t0 = time.perf_counter()
-        eng._launch(ids_in[-1], len(ids_in) - 1, ntok)
-        got = 0
-        eos = False
-        while got < ntok:
-            c = eng._tok_host[0]
-            if got < c:
-                new_ids = []
-                while got < c and got < ntok:
-                    got += 1
-                    tid = eng._tok_host[got]
-                    if tid == eos_id:
-                        eos = True
-                        continue
-                    if not eos:
-                        new_ids.append(tid)
-                if new_ids and on_tok:
-                    on_tok(new_ids)
-            elif got < ntok:
-                time.sleep(0.0005)
-        _c.stream_sync(eng.stream)
-    return got, time.perf_counter() - t0
-
-
-# ---------- http ----------
-
-def load_engine(slot):
-    """Init engine + tokenizer + warmup. Kernel stalls under GPU
-    contention are transient — retry a few times before giving up."""
-    for attempt in range(3):
+    def die(code=2):
+        log(f"ult-worker[{model_name}]: exiting ({code}) so the "
+            "dispatcher respawns with a fresh CUDA context")
         try:
-            slot["eng"] = slot["profile"]["engine"]()
-            slot["tok"] = Tokenizer.from_file(slot["profile"]["tok"])
-            bos = "<|begin▁of▁sentence|>" if slot["name"] == "qwen" \
-                else "<|startoftext|>"
-            slot["eng"].generate(slot["tok"].encode(bos + "hi").ids, 4)
-            slot["failed"] = None
-            return True
-        except Exception as e:
-            slot["eng"] = None
-            slot["failed"] = e
-            sys.stderr.write(
-                f"ult-serve: {slot['name']} load attempt "
-                f"{attempt + 1} failed: {e}\n")
-            time.sleep(3)
-    return False
+            sys.stdout.flush(); sys.stderr.flush()
+        except OSError:
+            pass
+        os._exit(code)
 
+    eng = make_engine(model_name)
+    tok = Tokenizer.from_file(profile["tok"])
 
-def make_handler(cfg):
-    def resolve(req_model):
-        """request model id -> loaded (or lazily loadable) engine slot."""
-        for name, slot in cfg["engines"].items():
-            if req_model in (name, slot["profile"]["name"]):
-                return slot
-        return cfg["engines"][cfg["default"]]
+    # warmup: the first launch after upload can emit garbage — burn one
+    # short generation so the first user message is clean
+    bos = "<|begin▁of▁sentence|>" if model_name == "qwen" else "<|startoftext|>"
+    try:
+        eng.generate(tok.encode(bos + "hi").ids, 4)
+    except Exception as e:
+        log(f"ult-worker[{model_name}]: warmup failed: {e}")
+        die(2)
+    log(f"ult-worker[{model_name}]: ready on :{port}")
 
-    def ensure_loaded(slot):
-        if slot["eng"] is not None or slot["failed"] is not None:
-            return
+    eos_id = profile["eos"]
+
+    def poisoned_exit():
+        threading.Timer(0.5, die, args=(2,)).start()
+
+    def generate(ids_in, ntok, on_tok=None):
+        """Prefill sequentially, then one decode launch; poll the mapped
+        token counter. Mirrors chat.py — do not reorder. Returns
+        (n_kernel_tokens, elapsed_s)."""
         with _lock:
-            if slot["eng"] is None and slot["failed"] is None:
-                t = time.perf_counter()
-                sys.stderr.write(
-                    f"ult-serve: lazy-loading {slot['profile']['name']} "
-                    "(first request may take a minute)...\n")
-                load_engine(slot)
-                sys.stderr.write(
-                    f"ult-serve: {slot['name']} ready "
-                    f"({time.perf_counter() - t:.1f}s)\n")
+            # drain any orphan kernel from a disconnected request — it
+            # keeps writing tokens[] while running
+            t_drain = time.perf_counter()
+            while not _c.stream_query(eng.stream):
+                if time.perf_counter() - t_drain > 30:
+                    raise TimeoutError("previous generation still active")
+                time.sleep(0.001)
+            eng._tok_host[0] = 0
+            eng._tok_host[MAXPOS + 4] = -1
+            _c.memset_dev(eng.d_bar, 0, 64)
+            _c.memset_dev(eng.d_plog, 0, (4 * 56 + 64 + 4096) * 4)
+            _c.sync()
 
-    class H(BaseHTTPRequestHandler):
+            for i, tk in enumerate(ids_in[:-1]):
+                eng._launch(tk, i, 1)
+                eng._wait()
+
+            # prefill launches bump tokens[0]/[1] — reset so the poll
+            # only counts DECODE tokens (the stale-slot bug)
+            eng._tok_host[0] = 0
+            _c.sync()
+
+            t0 = time.perf_counter()
+            eng._launch(ids_in[-1], len(ids_in) - 1, ntok)
+            got = 0
+            eos = False
+            deadline = t0 + GEN_TIMEOUT
+            while got < ntok:
+                c = eng._tok_host[0]
+                if got < c:
+                    new_ids = []
+                    while got < c and got < ntok:
+                        got += 1
+                        tid = eng._tok_host[got]
+                        # never decode a garbage slot — poisoned context /
+                        # stale write must surface as an error, not text
+                        if not 0 <= tid < 200000:
+                            raise RuntimeError(
+                                f"garbage token id {tid} at slot {got} "
+                                "(context likely corrupted)")
+                        if tid == eos_id:
+                            eos = True
+                            continue
+                        if not eos:
+                            new_ids.append(tid)
+                    if new_ids and on_tok:
+                        on_tok(new_ids)
+                    # kernel may finish early at EOS — don't wait for the
+                    # full ntok counter if the launch already returned
+                    if _c.stream_query(eng.stream):
+                        break
+                elif got < ntok:
+                    if time.perf_counter() > deadline:
+                        hb = eng._tok_host[MAXPOS + 4]
+                        raise TimeoutError(
+                            f"decode produced {got}/{ntok} tokens in "
+                            f"{GEN_TIMEOUT:.0f}s; heartbeat={hb}")
+                    time.sleep(0.0005)
+            _c.stream_sync(eng.stream)
+        return got, time.perf_counter() - t0
+
+    class WH(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def log_message(self, *a):
@@ -308,7 +327,7 @@ def make_handler(cfg):
             self.wfile.write(f"data: {data}\n\n".encode())
             self.wfile.flush()
 
-        def _chunk(self, model_id, delta, finish=None, usage=None):
+        def _chunk(self, delta, finish=None, usage=None):
             c = {"id": "ult", "object": "chat.completion.chunk",
                  "created": int(time.time()), "model": model_id,
                  "choices": [{"index": 0, "delta": delta,
@@ -317,16 +336,23 @@ def make_handler(cfg):
                 c["usage"] = usage
             return c
 
+        def _fail_after_response(self, code, obj):
+            """Send the error, then suicide — a stalled kernel is only
+            killed by destroying this process's CUDA context."""
+            try:
+                self._json(code, obj)
+                self.wfile.flush()
+            except OSError:
+                pass
+            poisoned_exit()
+
         def do_GET(self):
             _c.ctx_set_current()
             if self.path == "/health":
-                return self._json(200, {"status": "ok"})
+                return self._json(200, {"status": "ok", "model": model_id})
             if self.path in ("/v1/models", "/models"):
-                # advertise every profile — lazy-loads on first request,
-                # so /model in the TUI can switch freely
-                data = [{"id": s["profile"]["name"], "object": "model",
-                         "created": int(time.time()), "owned_by": "ult"}
-                        for s in cfg["engines"].values()]
+                data = [{"id": model_id, "object": "model",
+                         "created": int(time.time()), "owned_by": "ult"}]
                 return self._json(200, {"object": "list", "data": data})
             return self._json(404, {"error": "not found"})
 
@@ -341,32 +367,19 @@ def make_handler(cfg):
             except Exception:
                 return self._json(400, {"error": "bad json"})
 
-            slot = resolve(req.get("model") or "")
-            if slot["failed"] is not None:
-                return self._json(500, {"error":
-                    f"engine failed to load: {slot['failed']}"})
-            ensure_loaded(slot)
-            if slot["eng"] is None:
-                return self._json(500, {"error":
-                    f"engine failed to load: {slot['failed']}"})
-            profile, tok, eng = slot["profile"], slot["tok"], slot["eng"]
-            model_id = profile["name"]
-
             messages = req.get("messages") or []
             tools = req.get("tools") or req.get("functions")
-            if tools and cfg["tools_limit"] >= 0:
-                tools = tools[: cfg["tools_limit"]] or None
+            if tools and tools_limit >= 0:
+                tools = tools[:tools_limit] or None
             ntok = int(req.get("max_completion_tokens")
                        or req.get("max_tokens") or 512)
             stream = bool(req.get("stream"))
 
             prompt = render_prompt(profile, messages, tools)
             ids_in = tok.encode(prompt).ids
-            sys.stderr.write(
-                f"ult-serve: {model_id} prompt={len(ids_in)}tok "
-                f"gen≤{ntok} stream={stream}\n")
-            # truncate the middle of the prompt (keep head + tail)
-            ntok = max(1, min(ntok, MAXPOS - len(ids_in) - 8))
+            # the kernel always emits all ntok slots even after EOS —
+            # clamp so an agent's 16k max_tokens doesn't burn 25s/turn
+            ntok = max(1, min(ntok, MAX_GEN, MAXPOS - len(ids_in) - 8))
             if len(ids_in) + ntok > MAXPOS:
                 budget = MAXPOS - ntok - 8
                 if budget < 128:
@@ -374,17 +387,19 @@ def make_handler(cfg):
                         "error": "prompt too long for MAXPOS"})
                 keep = budget // 3
                 ids_in = ids_in[:keep] + ids_in[len(ids_in) - (budget - keep):]
-                sys.stderr.write(
-                    "ult-serve: prompt truncated to fit MAXPOS\n")
+                log(f"ult-worker[{model_name}]: prompt truncated to fit "
+                    "MAXPOS")
+            log(f"ult-worker[{model_name}]: prompt={len(ids_in)}tok "
+                f"gen<={ntok} stream={stream}")
 
             if stream and not tools:
-                return self._stream(slot, ids_in, ntok)
+                return self._stream(ids_in, ntok)
             try:
                 gen_ids = []
-                generate(profile, tok, eng,
-                         ids_in, ntok, on_tok=gen_ids.extend)
+                generate(ids_in, ntok, on_tok=gen_ids.extend)
             except Exception as e:
-                return self._json(500, {"error": f"engine: {e}"})
+                return self._fail_after_response(500,
+                                               {"error": f"engine: {e}"})
             text = tok.decode(gen_ids, skip_special_tokens=True)
             reasoning, clean = split_think(text)
             clean, calls = split_tool_calls(clean)
@@ -405,21 +420,18 @@ def make_handler(cfg):
                 return self._stream_buffered(resp)
             return self._json(200, resp)
 
-        def _stream_head(self, model_id):
+        def _stream_head(self):
             self.close_connection = True      # body ends at close
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
-            self._sse(self._chunk(model_id,
-                {"role": "assistant", "content": ""}))
+            self._sse(self._chunk({"role": "assistant", "content": ""}))
 
-        def _stream(self, slot, ids_in, ntok):
+        def _stream(self, ids_in, ntok):
             """Live SSE: decode-suffix deltas, think->reasoning split."""
-            model_id = slot["profile"]["name"]
-            self._stream_head(model_id)
-            tok = slot["tok"]
+            self._stream_head()
             state = {"ids": [], "think_done": False,
                      "sent_reason": 0, "sent_content": 0}
 
@@ -427,64 +439,304 @@ def make_handler(cfg):
                 s = state
                 s["ids"].extend(new_ids)
                 text = tok.decode(s["ids"], skip_special_tokens=True)
+                # decoded length can shrink when a special token is
+                # dropped mid-stream — never slice beyond the end
+                s["sent_reason"] = min(s["sent_reason"], len(text))
+                s["sent_content"] = min(s["sent_content"], len(text))
                 if not s["think_done"]:
                     if "</think>" not in text:
                         delta = text[s["sent_reason"]:]
                         if delta:
-                            self._sse(self._chunk(model_id,
-                                {"reasoning_content": delta}))
+                            self._sse(self._chunk({"reasoning_content":
+                                                   delta}))
                             s["sent_reason"] = len(text)
                         return
                     s["think_done"] = True
                     think, _, rest = text.partition("</think>")
                     delta = think[s["sent_reason"]:]
                     if delta:
-                        self._sse(self._chunk(model_id,
-                            {"reasoning_content": delta}))
+                        self._sse(self._chunk({"reasoning_content":
+                                               delta}))
                     s["sent_reason"] = len(think)
                     s["sent_content"] = 0
                     text = rest
                 delta = text[s["sent_content"]:]
                 if delta:
-                    self._sse(self._chunk(model_id, {"content": delta}))
+                    self._sse(self._chunk({"content": delta}))
                     s["sent_content"] = len(text)
 
             try:
-                got, dt = generate(slot["profile"], tok, slot["eng"],
-                                   ids_in, ntok, on_tok=emit)
+                got, dt = generate(ids_in, ntok, on_tok=emit)
                 n_gen = len(state["ids"])
             except Exception as e:
-                self._sse(self._chunk(model_id,
-                                      {"content": f"[ult error: {e}]"}))
-                n_gen = 0
+                try:
+                    self._sse(self._chunk({"content":
+                                           f"[ult error: {e}]"}))
+                    self._sse(self._chunk({}, finish="error"))
+                    self._sse("[DONE]")
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                poisoned_exit()     # stalled/poisoned ctx must die
+                return
             usage = {"prompt_tokens": len(ids_in),
                      "completion_tokens": n_gen,
                      "total_tokens": len(ids_in) + n_gen}
-            self._sse(self._chunk(model_id, {}, finish="stop",
-                                  usage=usage))
+            self._sse(self._chunk({}, finish="stop", usage=usage))
             self._sse("[DONE]")
 
         def _stream_buffered(self, resp):
             """tools + stream: parse first, then emit buffered chunks."""
-            model_id = resp["model"]
-            self._stream_head(model_id)
+            self._stream_head()
             msg = resp["choices"][0]["message"]
             if msg.get("reasoning_content"):
-                self._sse(self._chunk(model_id,
-                    {"reasoning_content": msg["reasoning_content"]}))
+                self._sse(self._chunk({"reasoning_content":
+                                       msg["reasoning_content"]}))
             if msg.get("content"):
-                self._sse(self._chunk(model_id,
-                                      {"content": msg["content"]}))
+                self._sse(self._chunk({"content": msg["content"]}))
             for i, tc in enumerate(msg.get("tool_calls") or []):
                 tc["index"] = i
-                self._sse(self._chunk(model_id, {"tool_calls": [tc]}))
-            self._sse(self._chunk(model_id, {},
+                self._sse(self._chunk({"tool_calls": [tc]}))
+            self._sse(self._chunk({},
                                   finish=resp["choices"][0]
                                   ["finish_reason"],
                                   usage=resp["usage"]))
             self._sse("[DONE]")
 
-    return H
+    class QuietServer(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            # client disconnects mid-stream are routine
+            pass
+
+    try:
+        QuietServer((host, port), WH).serve_forever()
+    finally:
+        die(0)
+
+
+# ================= dispatcher =================
+
+class Worker:
+    """One model = one subprocess = one CUDA context."""
+    def __init__(self, name, tools_limit):
+        self.name = name
+        self.tools_limit = tools_limit
+        self.proc = None
+        self.port = None
+        self.ready = threading.Event()
+        self.loading = False
+        self.restarts = 0
+        self.lock = threading.Lock()
+
+    def _free_port(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+
+    def spawn(self):
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                return
+            self.ready.clear()
+            self.loading = True
+            self.port = self._free_port()
+            self.proc = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__),
+                 "--worker", self.name,
+                 "--port", str(self.port),
+                 "--tools-limit", str(self.tools_limit)])
+            self.restarts += 1
+            threading.Thread(target=self._watch, daemon=True).start()
+            log(f"ult-serve: spawned {self.name} worker pid="
+                f"{self.proc.pid} :{self.port}")
+
+    def _watch(self):
+        proc = self.proc
+        deadline = time.perf_counter() + WORKER_READY_TIMEOUT
+        while proc.poll() is None and time.perf_counter() < deadline:
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                                  timeout=2)
+                conn.request("GET", "/health")
+                r = conn.getresponse()
+                r.read()
+                conn.close()
+                if r.status == 200:
+                    self.ready.set()
+                    self.loading = False
+                    log(f"ult-serve: {self.name} worker ready")
+                    proc.wait()
+                    log(f"ult-serve: {self.name} worker exited "
+                        f"(rc={proc.returncode})")
+                    return
+            except Exception:
+                pass
+            time.sleep(1.5)
+        self.loading = False
+        if proc.poll() is None:
+            log(f"ult-serve: {self.name} worker never became ready")
+        else:
+            log(f"ult-serve: {self.name} worker died during load "
+                f"(rc={proc.returncode})")
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def kill(self):
+        with self.lock:
+            p = self.proc
+            self.proc = None
+        if p and p.poll() is None:
+            try:
+                p.kill()
+            except OSError:
+                pass
+        self.ready.clear()
+
+
+def make_dispatcher_handler(models, tools_limit):
+    workers = {name: Worker(name, tools_limit) for name in models}
+    for w in workers.values():
+        w.spawn()
+
+    def cleanup():
+        for w in workers.values():
+            w.kill()
+    atexit.register(cleanup)
+
+    def resolve(req_model):
+        for name, w in workers.items():
+            if req_model in (name, PROFILES[name]["name"]):
+                return w
+        return workers[models[0]]
+
+    class DH(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _json(self, code, obj):
+            b = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            if self.path == "/health":
+                return self._json(200, {
+                    "status": "ok",
+                    "models": {n: ("ready" if w.ready.is_set()
+                                   else "loading" if w.alive()
+                                   else "dead")
+                               for n, w in workers.items()}})
+            if self.path in ("/v1/models", "/models"):
+                data = [{"id": PROFILES[n]["name"], "object": "model",
+                         "created": int(time.time()), "owned_by": "ult"}
+                        for n in workers]
+                return self._json(200, {"object": "list", "data": data})
+            return self._json(404, {"error": "not found"})
+
+        def do_POST(self):
+            if self.path not in ("/v1/chat/completions",
+                                 "/chat/completions"):
+                return self._json(404, {"error": "not found"})
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(n)
+                req = json.loads(body)
+            except Exception:
+                return self._json(400, {"error": "bad json"})
+
+            w = resolve(req.get("model") or "")
+            if not w.ready.is_set():
+                if w.alive() and w.loading:
+                    return self._json(503, {
+                        "error": f"{PROFILES[w.name]['name']} is still "
+                                 "loading (NVRTC compile — retry shortly)"})
+                # dead — one respawn in flight at a time
+                if not w.loading:
+                    w.spawn()
+                return self._json(503, {
+                    "error": f"{PROFILES[w.name]['name']} crashed and is "
+                             "restarting — retry shortly"})
+
+            # one kernel at a time across the whole GPU
+            with _lock:
+                try:
+                    conn = http.client.HTTPConnection(
+                        "127.0.0.1", w.port, timeout=GEN_TIMEOUT)
+                    conn.request("POST", "/v1/chat/completions",
+                                 body=body,
+                                 headers={"Content-Type":
+                                          "application/json"})
+                    resp = conn.getresponse()
+                except Exception as e:
+                    return self._json(502, {"error": f"worker: {e}"})
+
+                if resp.status != 200:
+                    payload = resp.read()
+                    conn.close()
+                    # a worker that stalled exits itself; force respawn
+                    if not w.alive():
+                        w.spawn()
+                    return self._relay(resp.status, payload)
+
+                want_stream = bool(req.get("stream")) and \
+                    "text/event-stream" in \
+                    (resp.getheader("Content-Type") or "")
+                try:
+                    if want_stream:
+                        self.close_connection = True
+                        self.send_response(200)
+                        self.send_header("Content-Type",
+                                         "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        while True:
+                            chunk = resp.read1(8192)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                    else:
+                        payload = resp.read()
+                        conn.close()
+                        return self._relay(200, payload)
+                except (TimeoutError, OSError, http.client.HTTPException) as e:
+                    # mid-stream stall: the worker's kernel may be
+                    # deadlocked — kill it; respawn happens on next use
+                    log(f"ult-serve: {w.name} stream failed: {e} — "
+                        "killing worker")
+                    w.kill()
+                    w.spawn()
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        def _relay(self, status, payload):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    class QuietServer(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            pass
+
+    return DH, QuietServer
 
 
 def main():
@@ -495,7 +747,15 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--tools-limit", type=int, default=8,
                     help="cap injected tool schemas (-1 = all)")
+    ap.add_argument("--worker", default=None,
+                    help=argparse.SUPPRESS)   # internal: worker mode
     args = ap.parse_args()
+
+    if args.worker:
+        if args.worker not in PROFILES:
+            ap.error(f"unknown model '{args.worker}'")
+        return run_worker(args.worker, args.host, args.port,
+                          args.tools_limit)
 
     wanted = [s.strip() for s in args.model.split(",") if s.strip()]
     if wanted == ["all"]:
@@ -504,38 +764,13 @@ def main():
         if name not in PROFILES:
             ap.error(f"unknown model '{name}' (choices: {list(PROFILES)})")
 
-    cfg = {"engines": {name: {"name": name, "profile": PROFILES[name],
-                              "eng": None, "tok": None, "failed": None}
-                       for name in wanted},
-           "default": wanted[0],
-           "tools_limit": args.tools_limit}
-
-    # eagerly load every requested engine — a lazy load inside a request
-    # looks like a hang (NVRTC compile + upload can take minutes). A
-    # stalled kernel under GPU contention retries; a dead engine is
-    # marked failed instead of killing the server.
-    for name, slot in cfg["engines"].items():
-        t = time.perf_counter()
-        print(f"ult-serve: loading {slot['profile']['name']}...",
-              flush=True)
-        if load_engine(slot):
-            print(f"ult-serve: {name} ready "
-                  f"({time.perf_counter() - t:.1f}s)", flush=True)
-        else:
-            print(f"ult-serve: {name} FAILED — will 500 on use",
-                  flush=True)
-
-    names = [s["profile"]["name"] for s in cfg["engines"].values()]
-    print(f"ult-serve [{cfg['default']}] "
-          f"http://{args.host}:{args.port}/v1  models={names}", flush=True)
-    class QuietServer(ThreadingHTTPServer):
-        def handle_error(self, request, client_address):
-            # client disconnects mid-stream are routine (interrupted
-            # turns) — don't dump a traceback for them
-            pass
-
-    QuietServer((args.host, args.port),
-                make_handler(cfg)).serve_forever()
+    DH, QuietServer = make_dispatcher_handler(wanted, args.tools_limit)
+    names = [PROFILES[n]["name"] for n in wanted]
+    print(f"ult-serve [{wanted[0]}] http://{args.host}:{args.port}/v1  "
+          f"models={names}", flush=True)
+    print("ult-serve: each model runs in its own process; a stalled "
+          "kernel kills only that worker and it respawns", flush=True)
+    QuietServer((args.host, args.port), DH).serve_forever()
 
 
 if __name__ == "__main__":

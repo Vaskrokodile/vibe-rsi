@@ -105,9 +105,14 @@ CUDA megakernels for consumer GPUs (RTX 3060-class), ~250 tok/s on
 
 ```
 vibe-ult.cmd                          # one-shot: server (all models) + TUI
-python tools/ult-serve/serve.py --model all --port 8321   # both models,
-                                        # lazy-loaded; /model switches live
+python tools/ult-serve/serve.py --model all --port 8321   # both models;
+                                        # /model switches live
 ```
+
+Each model runs in its own worker subprocess with its own CUDA context:
+a deadlocked persistent kernel can only be killed by destroying its
+context, so a stall exits the worker and the dispatcher respawns it —
+the other model keeps serving. `/health` reports per-worker state.
 
 then (if launching the harness manually):
 
@@ -122,7 +127,11 @@ The adapter injects tool schemas into the prompt and parses
 on small models), maps R1/LFM3 `<think>` into `reasoning_content`, and
 streams real SSE from the kernel's mapped token counter. Flags/env:
 `GA106_HOME` (engine source tree, default `E:\GA106`),
-`GA106_LFM3_VARIANT`, `--tools-limit` (cap injected schemas, default 8 —
+`GA106_LFM3_VARIANT`, `GA106_LFM3_BATCHED_PREFILL`,
+`ULT_MAX_GEN` (cap on generated tokens, default 1024 — the kernel emits
+all `ntok` slots even after EOS, so uncapped requests burn GPU),
+`ULT_GEN_TIMEOUT` (per-request wall clock, default 300s),
+`--tools-limit` (cap injected schemas, default 8 —
 small models can't juggle 20). The engine's `MAXPOS` window is 8192;
 oversized requests clamp generation then truncate mid-prompt.
 
