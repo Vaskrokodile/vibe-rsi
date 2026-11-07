@@ -127,7 +127,10 @@ The adapter injects tool schemas into the prompt and parses
 on small models), maps R1/LFM3 `<think>` into `reasoning_content`, and
 streams real SSE from the kernel's mapped token counter. Flags/env:
 `GA106_HOME` (engine source tree, default `E:\GA106`),
-`GA106_LFM3_VARIANT`, `GA106_LFM3_BATCHED_PREFILL`,
+`GA106_LFM3_VARIANT`, `ULT_PREFIX_CACHE` (default on — kv/conv state is
+position-absolute, so turns after the first only prefill the new tail of
+the prompt; `0` forces full prefill), `ULT_LFM3_BATCHED_PREFILL`
+(default on — cold LFM3 prompts ingest via one mma-chunked launch),
 `ULT_MAX_GEN` (cap on generated tokens, default 1024 — the kernel emits
 all `ntok` slots even after EOS, so uncapped requests burn GPU),
 `ULT_GEN_TIMEOUT` (per-request wall clock, default 300s),

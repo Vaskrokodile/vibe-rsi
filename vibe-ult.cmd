@@ -12,5 +12,8 @@ set XERA_API_KEY=ult
 rem qwen is ready in ~5s; lfm3 compiles for ~3min in the background —
 rem switch with /model once it's up
 if "%XERA_MODEL%"=="" set XERA_MODEL=ult-qwen-1.5b
+rem the rsi self-check is a second LLM call per turn — skip it on the
+rem small local models (set XERA_NO_VERIFY=0 to re-enable)
+if "%XERA_NO_VERIFY%"=="" set XERA_NO_VERIFY=1
 
 zig-out\bin\xera-rsi.exe %*

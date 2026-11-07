@@ -25,7 +25,10 @@ single decode launch, poll the mapped token counter, stream SSE.
 
 Env: GA106_HOME (default E:/GA106), ULT_QUANT (default q4),
      GA106_LFM3_VARIANT (q4|ult_exact|ult_hfma, default ult_exact),
-     GA106_LFM3_BATCHED_PREFILL=1 to enable LFM3 batched prefill,
+     ULT_PREFIX_CACHE=0 to disable KV prefix caching (default on —
+     turns after the first skip all but the new tail of the prompt),
+     ULT_LFM3_BATCHED_PREFILL=0 to disable the one-launch mma prefill
+     on LFM3 cold prompts (default on),
      ULT_MAX_GEN (cap on generated tokens, default 1024 — the kernel
      always fills ntok slots even after EOS, so uncapped requests burn
      GPU for nothing),
@@ -227,6 +230,14 @@ def run_worker(model_name, host, port, tools_limit):
     eng = make_engine(model_name)
     tok = Tokenizer.from_file(profile["tok"])
 
+    # KV/conv-state prefix cache: positions are absolute and the kv/conv
+    # buffers persist across requests, so a chat turn only needs to
+    # prefill tokens past the longest shared prefix — a 1600-token agent
+    # prompt re-prefills ~20 tokens, not 1600. Set ULT_PREFIX_CACHE=0 to
+    # force full prefill every request.
+    prefix_cache = os.environ.get("ULT_PREFIX_CACHE", "1") != "0"
+    kv_state = {"ids": []}
+
     # warmup: the first launch after upload can emit garbage — burn one
     # short generation so the first user message is clean
     bos = "<|begin▁of▁sentence|>" if model_name == "qwen" else "<|startoftext|>"
@@ -235,6 +246,20 @@ def run_worker(model_name, host, port, tools_limit):
     except Exception as e:
         log(f"ult-worker[{model_name}]: warmup failed: {e}")
         die(2)
+
+    # pre-build the batched-prefill kernel at startup (W5 repack + NVRTC
+    # is ~40s once, cached on disk) so the first cold request stays fast
+    lfm3_batched = (model_name == "lfm3"
+                    and os.environ.get("ULT_LFM3_BATCHED_PREFILL", "1")
+                        != "0"
+                    and hasattr(eng, "_init_batched_prefill"))
+    if lfm3_batched:
+        try:
+            eng._init_batched_prefill()
+        except Exception as e:
+            lfm3_batched = False
+            log(f"ult-worker[{model_name}]: batched prefill init "
+                f"failed, sequential fallback: {e}")
     log(f"ult-worker[{model_name}]: ready on :{port}")
 
     eos_id = profile["eos"]
@@ -248,21 +273,48 @@ def run_worker(model_name, host, port, tools_limit):
         (n_kernel_tokens, elapsed_s)."""
         with _lock:
             # drain any orphan kernel from a disconnected request — it
-            # keeps writing tokens[] while running
+            # keeps writing tokens[] while running. A drained orphan also
+            # wrote KV we can't attribute -> prefix cache is invalid.
             t_drain = time.perf_counter()
+            was_busy = not _c.stream_query(eng.stream)
             while not _c.stream_query(eng.stream):
                 if time.perf_counter() - t_drain > 30:
                     raise TimeoutError("previous generation still active")
                 time.sleep(0.001)
+            if was_busy:
+                kv_state["ids"] = []
             eng._tok_host[0] = 0
             eng._tok_host[MAXPOS + 4] = -1
             _c.memset_dev(eng.d_bar, 0, 64)
             _c.memset_dev(eng.d_plog, 0, (4 * 56 + 64 + 4096) * 4)
             _c.sync()
 
-            for i, tk in enumerate(ids_in[:-1]):
-                eng._launch(tk, i, 1)
-                eng._wait()
+            # skip prefill for the longest cached prefix — kv/conv state
+            # at those positions is still valid from the last request
+            c = 0
+            if prefix_cache:
+                cached = kv_state["ids"]
+                lim = min(len(cached), len(ids_in) - 1)
+                while c < lim and cached[c] == ids_in[c]:
+                    c += 1
+            skipped = c
+            batched = (skipped == 0 and lfm3_batched
+                       and len(ids_in) > 64)
+            if batched:
+                # one mma-chunked launch for the whole prompt instead of
+                # ~1600 sequential ones; leaves kv/conv in the same
+                # state (upstream: "same state ... up to f16 rounding")
+                log(f"ult-worker[{model_name}]: batched prefill "
+                    f"({len(ids_in) - 1} tok)")
+                eng._prefill_batched(ids_in)
+            else:
+                if skipped:
+                    log(f"ult-worker[{model_name}]: prefix hit — "
+                        f"prefilling {len(ids_in) - 1 - skipped}/"
+                        f"{len(ids_in) - 1} tok")
+                for i in range(skipped, len(ids_in) - 1):
+                    eng._launch(ids_in[i], i, 1)
+                    eng._wait()
 
             # prefill launches bump tokens[0]/[1] — reset so the poll
             # only counts DECODE tokens (the stale-slot bug)
@@ -273,7 +325,8 @@ def run_worker(model_name, host, port, tools_limit):
             eng._launch(ids_in[-1], len(ids_in) - 1, ntok)
             got = 0
             eos = False
-            deadline = t0 + GEN_TIMEOUT
+            raw = []                    # every emitted id (KV was written
+            deadline = t0 + GEN_TIMEOUT # for all of them — cache fodder)
             while got < ntok:
                 c = eng._tok_host[0]
                 if got < c:
@@ -287,6 +340,7 @@ def run_worker(model_name, host, port, tools_limit):
                             raise RuntimeError(
                                 f"garbage token id {tid} at slot {got} "
                                 "(context likely corrupted)")
+                        raw.append(tid)
                         if tid == eos_id:
                             eos = True
                             continue
@@ -306,6 +360,9 @@ def run_worker(model_name, host, port, tools_limit):
                             f"{GEN_TIMEOUT:.0f}s; heartbeat={hb}")
                     time.sleep(0.0005)
             _c.stream_sync(eng.stream)
+            # every emitted slot occupies an absolute position — the
+            # whole processed sequence is a valid prefix next time
+            kv_state["ids"] = (ids_in + raw)[:MAXPOS - 1]
         return got, time.perf_counter() - t0
 
     class WH(BaseHTTPRequestHandler):
