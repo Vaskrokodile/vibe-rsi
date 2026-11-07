@@ -303,13 +303,11 @@ pub const Term = struct {
         // A buffered char that didn't complete a UTF-8 sequence by the end
         // of the batch is ordinary Latin-1 input — don't leave it pending.
         try self.flushMoji(keys);
-        // A sequence still open here was truncated by the console (or the
-        // window closed). Never leak its bytes into the composer.
-        if (self.state == .csi and self.seq_len > 0) {
-            try self.emitCsiBody(keys, 0, false);
-        }
-        self.state = .ground;
-        self.seq_len = 0;
+        // A sequence still open here was SPLIT by the console's 32-record
+        // batch (mouse-report floods guarantee this). Keep the parser
+        // state so continuation bytes in the next batch complete the
+        // sequence — resetting to .ground would leak them into the
+        // composer as literal junk like "2M2;3M".
     }
 
     /// Reassemble VT sequences byte by byte. With ENABLE_VIRTUAL_TERMINAL_INPUT

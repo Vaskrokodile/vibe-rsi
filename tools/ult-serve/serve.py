@@ -236,7 +236,11 @@ def run_worker(model_name, host, port, tools_limit):
     # prompt re-prefills ~20 tokens, not 1600. Set ULT_PREFIX_CACHE=0 to
     # force full prefill every request.
     prefix_cache = os.environ.get("ULT_PREFIX_CACHE", "1") != "0"
-    kv_state = {"ids": []}
+    # "safe" = the last request finished decoding cleanly, so an orphan
+    # found running now is just a post-EOS chunk tail — it only wrote
+    # positions past our recorded prefix, which stays valid. If a request
+    # died mid-prefill/decode, KV may be corrupt -> drop the cache.
+    kv_state = {"ids": [], "safe": True}
 
     # warmup: the first launch after upload can emit garbage — burn one
     # short generation so the first user message is clean
@@ -281,8 +285,9 @@ def run_worker(model_name, host, port, tools_limit):
                 if time.perf_counter() - t_drain > 30:
                     raise TimeoutError("previous generation still active")
                 time.sleep(0.001)
-            if was_busy:
+            if was_busy and not kv_state["safe"]:
                 kv_state["ids"] = []
+            kv_state["safe"] = False   # until this request finishes
             eng._tok_host[0] = 0
             eng._tok_host[MAXPOS + 4] = -1
             _c.memset_dev(eng.d_bar, 0, 64)
@@ -322,48 +327,71 @@ def run_worker(model_name, host, port, tools_limit):
             _c.sync()
 
             t0 = time.perf_counter()
-            eng._launch(ids_in[-1], len(ids_in) - 1, ntok)
-            got = 0
+            deadline = t0 + GEN_TIMEOUT
+            pos = len(ids_in) - 1
+            start_tok = ids_in[-1]
+            emitted = 0
+            raw = []            # every emitted id — KV was written for it
             eos = False
-            raw = []                    # every emitted id (KV was written
-            deadline = t0 + GEN_TIMEOUT # for all of them — cache fodder)
-            while got < ntok:
-                c = eng._tok_host[0]
-                if got < c:
-                    new_ids = []
-                    while got < c and got < ntok:
-                        got += 1
-                        tid = eng._tok_host[got]
-                        # never decode a garbage slot — poisoned context /
-                        # stale write must surface as an error, not text
-                        if not 0 <= tid < 200000:
-                            raise RuntimeError(
-                                f"garbage token id {tid} at slot {got} "
-                                "(context likely corrupted)")
-                        raw.append(tid)
-                        if tid == eos_id:
-                            eos = True
-                            continue
-                        if not eos:
-                            new_ids.append(tid)
-                    if new_ids and on_tok:
-                        on_tok(new_ids)
-                    # kernel may finish early at EOS — don't wait for the
-                    # full ntok counter if the launch already returned
-                    if _c.stream_query(eng.stream):
-                        break
-                elif got < ntok:
-                    if time.perf_counter() > deadline:
-                        hb = eng._tok_host[MAXPOS + 4]
-                        raise TimeoutError(
-                            f"decode produced {got}/{ntok} tokens in "
-                            f"{GEN_TIMEOUT:.0f}s; heartbeat={hb}")
-                    time.sleep(0.0005)
-            _c.stream_sync(eng.stream)
+            # the kernel ALWAYS generates exactly ntok tokens — no EOS
+            # early-stop. Chunk the decode so an EOS at token 5 doesn't
+            # burn a 1024-slot kernel; the tail of the last chunk keeps
+            # running as a bounded orphan the next request drains.
+            CHUNK = 128
+            while emitted < ntok and not eos:
+                want = min(CHUNK, ntok - emitted)
+                eng._tok_host[0] = 0       # count only this chunk
+                _c.sync()
+                eng._launch(start_tok, pos, want)
+                got = 0
+                while got < want:
+                    c = eng._tok_host[0]
+                    if got < c:
+                        new_ids = []
+                        while got < c and got < want:
+                            got += 1
+                            tid = eng._tok_host[got]
+                            # never decode a garbage slot — a poisoned
+                            # context must error, not emit text
+                            if not 0 <= tid < 200000:
+                                raise RuntimeError(
+                                    f"garbage token id {tid} at slot "
+                                    f"{got} (context likely corrupted)")
+                            raw.append(tid)
+                            if tid == eos_id:
+                                eos = True
+                                continue
+                            if not eos:
+                                new_ids.append(tid)
+                        if new_ids and on_tok:
+                            on_tok(new_ids)
+                        if eos or _c.stream_query(eng.stream):
+                            break
+                    elif got < want:
+                        if time.perf_counter() > deadline:
+                            hb = eng._tok_host[MAXPOS + 4]
+                            raise TimeoutError(
+                                f"decode produced {emitted + got}/{ntok} "
+                                f"tokens in {GEN_TIMEOUT:.0f}s; "
+                                f"heartbeat={hb}")
+                        time.sleep(0.0005)
+                emitted += got
+                if eos or got < want:
+                    # EOS: leave the rest of the chunk running as an
+                    # orphan — don't stream_sync or we wait for all of it
+                    break
+                _c.stream_sync(eng.stream)
+                if not raw:
+                    break
+                start_tok = raw[-1]      # last emitted = next start token
+                pos += got               # positions are absolute
+            if not eos:
+                _c.stream_sync(eng.stream)
             # every emitted slot occupies an absolute position — the
-            # whole processed sequence is a valid prefix next time
+            # processed prefix is valid kv/conv state next time
             kv_state["ids"] = (ids_in + raw)[:MAXPOS - 1]
-        return got, time.perf_counter() - t0
+            kv_state["safe"] = True
+        return emitted, time.perf_counter() - t0
 
     class WH(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -561,6 +589,9 @@ def run_worker(model_name, host, port, tools_limit):
             self._sse("[DONE]")
 
     class QuietServer(ThreadingHTTPServer):
+        # Windows SO_REUSEADDR permits a second process to bind the same
+        # port — a silent split-brain. Refuse it instead.
+        allow_reuse_address = False
         daemon_threads = True
 
         def handle_error(self, request, client_address):
@@ -788,6 +819,7 @@ def make_dispatcher_handler(models, tools_limit):
             self.wfile.write(payload)
 
     class QuietServer(ThreadingHTTPServer):
+        allow_reuse_address = False   # never two dispatchers on one port
         daemon_threads = True
 
         def handle_error(self, request, client_address):
@@ -820,6 +852,18 @@ def main():
     for name in wanted:
         if name not in PROFILES:
             ap.error(f"unknown model '{name}' (choices: {list(PROFILES)})")
+
+    # fail fast before spawning workers — a second dispatcher on the same
+    # port is a silent split-brain (two contexts, random routing)
+    probe = socket.socket()
+    try:
+        probe.bind((args.host, args.port))
+    except OSError:
+        probe.close()
+        print(f"ult-serve: {args.host}:{args.port} is already in use — "
+              "is another instance running?", file=sys.stderr, flush=True)
+        sys.exit(1)
+    probe.close()
 
     DH, QuietServer = make_dispatcher_handler(wanted, args.tools_limit)
     names = [PROFILES[n]["name"] for n in wanted]
