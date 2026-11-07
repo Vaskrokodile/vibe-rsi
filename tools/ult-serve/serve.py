@@ -245,6 +245,28 @@ def generate(profile, tok, eng, ids_in, ntok, on_tok=None):
 
 # ---------- http ----------
 
+def load_engine(slot):
+    """Init engine + tokenizer + warmup. Kernel stalls under GPU
+    contention are transient — retry a few times before giving up."""
+    for attempt in range(3):
+        try:
+            slot["eng"] = slot["profile"]["engine"]()
+            slot["tok"] = Tokenizer.from_file(slot["profile"]["tok"])
+            bos = "<|begin▁of▁sentence|>" if slot["name"] == "qwen" \
+                else "<|startoftext|>"
+            slot["eng"].generate(slot["tok"].encode(bos + "hi").ids, 4)
+            slot["failed"] = None
+            return True
+        except Exception as e:
+            slot["eng"] = None
+            slot["failed"] = e
+            sys.stderr.write(
+                f"ult-serve: {slot['name']} load attempt "
+                f"{attempt + 1} failed: {e}\n")
+            time.sleep(3)
+    return False
+
+
 def make_handler(cfg):
     def resolve(req_model):
         """request model id -> loaded (or lazily loadable) engine slot."""
@@ -254,17 +276,18 @@ def make_handler(cfg):
         return cfg["engines"][cfg["default"]]
 
     def ensure_loaded(slot):
-        if slot["eng"] is not None:
+        if slot["eng"] is not None or slot["failed"] is not None:
             return
         with _lock:
-            if slot["eng"] is None:
+            if slot["eng"] is None and slot["failed"] is None:
+                t = time.perf_counter()
                 sys.stderr.write(
-                    f"ult-serve: loading {slot['profile']['name']}...\n")
-                slot["eng"] = slot["profile"]["engine"]()
-                slot["tok"] = Tokenizer.from_file(slot["profile"]["tok"])
-                bos = "<|begin▁of▁sentence|>" if slot["name"] == "qwen" \
-                    else "<|startoftext|>"
-                slot["eng"].generate(slot["tok"].encode(bos + "hi").ids, 4)
+                    f"ult-serve: lazy-loading {slot['profile']['name']} "
+                    "(first request may take a minute)...\n")
+                load_engine(slot)
+                sys.stderr.write(
+                    f"ult-serve: {slot['name']} ready "
+                    f"({time.perf_counter() - t:.1f}s)\n")
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -319,10 +342,13 @@ def make_handler(cfg):
                 return self._json(400, {"error": "bad json"})
 
             slot = resolve(req.get("model") or "")
-            try:
-                ensure_loaded(slot)
-            except Exception as e:
-                return self._json(500, {"error": f"engine load: {e}"})
+            if slot["failed"] is not None:
+                return self._json(500, {"error":
+                    f"engine failed to load: {slot['failed']}"})
+            ensure_loaded(slot)
+            if slot["eng"] is None:
+                return self._json(500, {"error":
+                    f"engine failed to load: {slot['failed']}"})
             profile, tok, eng = slot["profile"], slot["tok"], slot["eng"]
             model_id = profile["name"]
 
@@ -336,7 +362,9 @@ def make_handler(cfg):
 
             prompt = render_prompt(profile, messages, tools)
             ids_in = tok.encode(prompt).ids
-            # fixed MAXPOS window: shrink generation budget first, then
+            sys.stderr.write(
+                f"ult-serve: {model_id} prompt={len(ids_in)}tok "
+                f"gen≤{ntok} stream={stream}\n")
             # truncate the middle of the prompt (keep head + tail)
             ntok = max(1, min(ntok, MAXPOS - len(ids_in) - 8))
             if len(ids_in) + ntok > MAXPOS:
@@ -477,25 +505,37 @@ def main():
             ap.error(f"unknown model '{name}' (choices: {list(PROFILES)})")
 
     cfg = {"engines": {name: {"name": name, "profile": PROFILES[name],
-                              "eng": None, "tok": None}
+                              "eng": None, "tok": None, "failed": None}
                        for name in wanted},
            "default": wanted[0],
            "tools_limit": args.tools_limit}
 
-    # eagerly load the default engine so the first request isn't a
-    # model-upload wait; others lazy-load on demand (VRAM permitting)
-    slot = cfg["engines"][cfg["default"]]
-    slot["eng"] = slot["profile"]["engine"]()
-    slot["tok"] = Tokenizer.from_file(slot["profile"]["tok"])
-    bos = "<|begin▁of▁sentence|>" if cfg["default"] == "qwen" \
-        else "<|startoftext|>"
-    slot["eng"].generate(slot["tok"].encode(bos + "hi").ids, 4)
+    # eagerly load every requested engine — a lazy load inside a request
+    # looks like a hang (NVRTC compile + upload can take minutes). A
+    # stalled kernel under GPU contention retries; a dead engine is
+    # marked failed instead of killing the server.
+    for name, slot in cfg["engines"].items():
+        t = time.perf_counter()
+        print(f"ult-serve: loading {slot['profile']['name']}...",
+              flush=True)
+        if load_engine(slot):
+            print(f"ult-serve: {name} ready "
+                  f"({time.perf_counter() - t:.1f}s)", flush=True)
+        else:
+            print(f"ult-serve: {name} FAILED — will 500 on use",
+                  flush=True)
 
     names = [s["profile"]["name"] for s in cfg["engines"].values()]
-    print(f"ult-serve [{cfg['default']}:{slot['eng'].quant}] "
+    print(f"ult-serve [{cfg['default']}] "
           f"http://{args.host}:{args.port}/v1  models={names}", flush=True)
-    ThreadingHTTPServer((args.host, args.port),
-                        make_handler(cfg)).serve_forever()
+    class QuietServer(ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            # client disconnects mid-stream are routine (interrupted
+            # turns) — don't dump a traceback for them
+            pass
+
+    QuietServer((args.host, args.port),
+                make_handler(cfg)).serve_forever()
 
 
 if __name__ == "__main__":
