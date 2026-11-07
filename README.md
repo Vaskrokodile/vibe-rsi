@@ -104,11 +104,12 @@ CUDA megakernels for consumer GPUs (RTX 3060-class), ~250 tok/s on
 1.5–1.7B Q4 models:
 
 ```
-python tools/ult-serve/serve.py --model qwen --port 8321   # DeepSeek-R1 1.5B
-python tools/ult-serve/serve.py --model lfm3 --port 8321   # LiquidAI LFM3 1.7B
+vibe-ult.cmd                          # one-shot: server (all models) + TUI
+python tools/ult-serve/serve.py --model all --port 8321   # both models,
+                                        # lazy-loaded; /model switches live
 ```
 
-then:
+then (if launching the harness manually):
 
 ```powershell
 $env:XERA_BASE_URL="http://127.0.0.1:8321/v1"

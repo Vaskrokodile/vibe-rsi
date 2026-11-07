@@ -246,6 +246,26 @@ def generate(profile, tok, eng, ids_in, ntok, on_tok=None):
 # ---------- http ----------
 
 def make_handler(cfg):
+    def resolve(req_model):
+        """request model id -> loaded (or lazily loadable) engine slot."""
+        for name, slot in cfg["engines"].items():
+            if req_model in (name, slot["profile"]["name"]):
+                return slot
+        return cfg["engines"][cfg["default"]]
+
+    def ensure_loaded(slot):
+        if slot["eng"] is not None:
+            return
+        with _lock:
+            if slot["eng"] is None:
+                sys.stderr.write(
+                    f"ult-serve: loading {slot['profile']['name']}...\n")
+                slot["eng"] = slot["profile"]["engine"]()
+                slot["tok"] = Tokenizer.from_file(slot["profile"]["tok"])
+                bos = "<|begin▁of▁sentence|>" if slot["name"] == "qwen" \
+                    else "<|startoftext|>"
+                slot["eng"].generate(slot["tok"].encode(bos + "hi").ids, 4)
+
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -265,9 +285,9 @@ def make_handler(cfg):
             self.wfile.write(f"data: {data}\n\n".encode())
             self.wfile.flush()
 
-        def _chunk(self, delta, finish=None, usage=None):
+        def _chunk(self, model_id, delta, finish=None, usage=None):
             c = {"id": "ult", "object": "chat.completion.chunk",
-                 "created": int(time.time()), "model": cfg["model_id"],
+                 "created": int(time.time()), "model": model_id,
                  "choices": [{"index": 0, "delta": delta,
                               "finish_reason": finish}]}
             if usage:
@@ -279,8 +299,11 @@ def make_handler(cfg):
             if self.path == "/health":
                 return self._json(200, {"status": "ok"})
             if self.path in ("/v1/models", "/models"):
-                data = [{"id": cfg["model_id"], "object": "model",
-                         "created": int(time.time()), "owned_by": "ult"}]
+                # advertise every profile — lazy-loads on first request,
+                # so /model in the TUI can switch freely
+                data = [{"id": s["profile"]["name"], "object": "model",
+                         "created": int(time.time()), "owned_by": "ult"}
+                        for s in cfg["engines"].values()]
                 return self._json(200, {"object": "list", "data": data})
             return self._json(404, {"error": "not found"})
 
@@ -295,6 +318,14 @@ def make_handler(cfg):
             except Exception:
                 return self._json(400, {"error": "bad json"})
 
+            slot = resolve(req.get("model") or "")
+            try:
+                ensure_loaded(slot)
+            except Exception as e:
+                return self._json(500, {"error": f"engine load: {e}"})
+            profile, tok, eng = slot["profile"], slot["tok"], slot["eng"]
+            model_id = profile["name"]
+
             messages = req.get("messages") or []
             tools = req.get("tools") or req.get("functions")
             if tools and cfg["tools_limit"] >= 0:
@@ -303,8 +334,8 @@ def make_handler(cfg):
                        or req.get("max_tokens") or 512)
             stream = bool(req.get("stream"))
 
-            prompt = render_prompt(cfg["profile"], messages, tools)
-            ids_in = cfg["tok"].encode(prompt).ids
+            prompt = render_prompt(profile, messages, tools)
+            ids_in = tok.encode(prompt).ids
             # fixed MAXPOS window: shrink generation budget first, then
             # truncate the middle of the prompt (keep head + tail)
             ntok = max(1, min(ntok, MAXPOS - len(ids_in) - 8))
@@ -319,14 +350,14 @@ def make_handler(cfg):
                     "ult-serve: prompt truncated to fit MAXPOS\n")
 
             if stream and not tools:
-                return self._stream(ids_in, ntok)
+                return self._stream(slot, ids_in, ntok)
             try:
                 gen_ids = []
-                generate(cfg["profile"], cfg["tok"], cfg["eng"],
+                generate(profile, tok, eng,
                          ids_in, ntok, on_tok=gen_ids.extend)
             except Exception as e:
                 return self._json(500, {"error": f"engine: {e}"})
-            text = cfg["tok"].decode(gen_ids, skip_special_tokens=True)
+            text = tok.decode(gen_ids, skip_special_tokens=True)
             reasoning, clean = split_think(text)
             clean, calls = split_tool_calls(clean)
             msg = {"role": "assistant", "content": clean}
@@ -335,7 +366,7 @@ def make_handler(cfg):
             if calls:
                 msg["tool_calls"] = calls
             resp = {"id": "ult", "object": "chat.completion",
-                    "created": int(time.time()), "model": cfg["model_id"],
+                    "created": int(time.time()), "model": model_id,
                     "choices": [{"index": 0, "message": msg,
                                  "finish_reason":
                                  "tool_calls" if calls else "stop"}],
@@ -346,20 +377,21 @@ def make_handler(cfg):
                 return self._stream_buffered(resp)
             return self._json(200, resp)
 
-        def _stream_head(self):
+        def _stream_head(self, model_id):
             self.close_connection = True      # body ends at close
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
-            self._sse(self._chunk(
+            self._sse(self._chunk(model_id,
                 {"role": "assistant", "content": ""}))
 
-        def _stream(self, ids_in, ntok):
+        def _stream(self, slot, ids_in, ntok):
             """Live SSE: decode-suffix deltas, think->reasoning split."""
-            self._stream_head()
-            tok = cfg["tok"]
+            model_id = slot["profile"]["name"]
+            self._stream_head(model_id)
+            tok = slot["tok"]
             state = {"ids": [], "think_done": False,
                      "sent_reason": 0, "sent_content": 0}
 
@@ -371,7 +403,7 @@ def make_handler(cfg):
                     if "</think>" not in text:
                         delta = text[s["sent_reason"]:]
                         if delta:
-                            self._sse(self._chunk(
+                            self._sse(self._chunk(model_id,
                                 {"reasoning_content": delta}))
                             s["sent_reason"] = len(text)
                         return
@@ -379,42 +411,46 @@ def make_handler(cfg):
                     think, _, rest = text.partition("</think>")
                     delta = think[s["sent_reason"]:]
                     if delta:
-                        self._sse(self._chunk(
+                        self._sse(self._chunk(model_id,
                             {"reasoning_content": delta}))
                     s["sent_reason"] = len(think)
                     s["sent_content"] = 0
                     text = rest
                 delta = text[s["sent_content"]:]
                 if delta:
-                    self._sse(self._chunk({"content": delta}))
+                    self._sse(self._chunk(model_id, {"content": delta}))
                     s["sent_content"] = len(text)
 
             try:
-                got, dt = generate(cfg["profile"], cfg["tok"], cfg["eng"],
+                got, dt = generate(slot["profile"], tok, slot["eng"],
                                    ids_in, ntok, on_tok=emit)
                 n_gen = len(state["ids"])
             except Exception as e:
-                self._sse(self._chunk({"content": f"[ult error: {e}]"}))
+                self._sse(self._chunk(model_id,
+                                      {"content": f"[ult error: {e}]"}))
                 n_gen = 0
             usage = {"prompt_tokens": len(ids_in),
                      "completion_tokens": n_gen,
                      "total_tokens": len(ids_in) + n_gen}
-            self._sse(self._chunk({}, finish="stop", usage=usage))
+            self._sse(self._chunk(model_id, {}, finish="stop",
+                                  usage=usage))
             self._sse("[DONE]")
 
         def _stream_buffered(self, resp):
             """tools + stream: parse first, then emit buffered chunks."""
-            self._stream_head()
+            model_id = resp["model"]
+            self._stream_head(model_id)
             msg = resp["choices"][0]["message"]
             if msg.get("reasoning_content"):
-                self._sse(self._chunk(
+                self._sse(self._chunk(model_id,
                     {"reasoning_content": msg["reasoning_content"]}))
             if msg.get("content"):
-                self._sse(self._chunk({"content": msg["content"]}))
+                self._sse(self._chunk(model_id,
+                                      {"content": msg["content"]}))
             for i, tc in enumerate(msg.get("tool_calls") or []):
                 tc["index"] = i
-                self._sse(self._chunk({"tool_calls": [tc]}))
-            self._sse(self._chunk({},
+                self._sse(self._chunk(model_id, {"tool_calls": [tc]}))
+            self._sse(self._chunk(model_id, {},
                                   finish=resp["choices"][0]
                                   ["finish_reason"],
                                   usage=resp["usage"]))
@@ -425,30 +461,39 @@ def make_handler(cfg):
 
 def main():
     ap = argparse.ArgumentParser(description="ULT OpenAI-compatible server")
-    ap.add_argument("--model", default="qwen",
-                    choices=list(PROFILES), help="engine profile")
+    ap.add_argument("--model", default="all",
+                    help="engine profile(s): qwen, lfm3, all, or comma list")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--tools-limit", type=int, default=8,
                     help="cap injected tool schemas (-1 = all)")
     args = ap.parse_args()
 
-    profile = PROFILES[args.model]
-    tok = Tokenizer.from_file(profile["tok"])
-    eng = profile["engine"]()
-    cfg = {"profile": profile, "tok": tok, "eng": eng,
-           "model_id": profile["name"],
+    wanted = [s.strip() for s in args.model.split(",") if s.strip()]
+    if wanted == ["all"]:
+        wanted = list(PROFILES)
+    for name in wanted:
+        if name not in PROFILES:
+            ap.error(f"unknown model '{name}' (choices: {list(PROFILES)})")
+
+    cfg = {"engines": {name: {"name": name, "profile": PROFILES[name],
+                              "eng": None, "tok": None}
+                       for name in wanted},
+           "default": wanted[0],
            "tools_limit": args.tools_limit}
 
-    # warmup: first launch after upload can emit garbage — burn one
-    # short generation so the first request is clean (chat.py does this)
-    bos = "<|begin▁of▁sentence|>" if args.model == "qwen" \
+    # eagerly load the default engine so the first request isn't a
+    # model-upload wait; others lazy-load on demand (VRAM permitting)
+    slot = cfg["engines"][cfg["default"]]
+    slot["eng"] = slot["profile"]["engine"]()
+    slot["tok"] = Tokenizer.from_file(slot["profile"]["tok"])
+    bos = "<|begin▁of▁sentence|>" if cfg["default"] == "qwen" \
         else "<|startoftext|>"
-    eng.generate(tok.encode(bos + "hi").ids, 4)
+    slot["eng"].generate(slot["tok"].encode(bos + "hi").ids, 4)
 
-    print(f"ult-serve [{args.model}:{eng.quant}] "
-          f"http://{args.host}:{args.port}/v1  model={cfg['model_id']}",
-          flush=True)
+    names = [s["profile"]["name"] for s in cfg["engines"].values()]
+    print(f"ult-serve [{cfg['default']}:{slot['eng'].quant}] "
+          f"http://{args.host}:{args.port}/v1  models={names}", flush=True)
     ThreadingHTTPServer((args.host, args.port),
                         make_handler(cfg)).serve_forever()
 
