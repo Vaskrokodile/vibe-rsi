@@ -51,7 +51,8 @@ sys.path.insert(0, GA106)
 
 MAXPOS = 8192
 MAX_GEN = int(os.environ.get("ULT_MAX_GEN", "1024"))
-GEN_TIMEOUT = float(os.environ.get("ULT_GEN_TIMEOUT", "300"))
+GEN_TIMEOUT = float(os.environ.get("ULT_GEN_TIMEOUT", "900"))
+STALL_TIMEOUT = float(os.environ.get("ULT_STALL_TIMEOUT", "90"))
 WORKER_READY_TIMEOUT = float(os.environ.get("ULT_WORKER_READY", "420"))
 _lock = threading.Lock()          # one persistent kernel at a time
 
@@ -327,7 +328,8 @@ def run_worker(model_name, host, port, tools_limit):
             _c.sync()
 
             t0 = time.perf_counter()
-            deadline = t0 + GEN_TIMEOUT
+            stall_deadline = t0 + STALL_TIMEOUT   # renewed on progress
+            hard_deadline = t0 + GEN_TIMEOUT      # absolute ceiling
             pos = len(ids_in) - 1
             start_tok = ids_in[-1]
             emitted = 0
@@ -365,15 +367,17 @@ def run_worker(model_name, host, port, tools_limit):
                                 new_ids.append(tid)
                         if new_ids and on_tok:
                             on_tok(new_ids)
+                        stall_deadline = time.perf_counter() \
+                            + STALL_TIMEOUT
                         if eos or _c.stream_query(eng.stream):
                             break
                     elif got < want:
-                        if time.perf_counter() > deadline:
+                        now = time.perf_counter()
+                        if now > stall_deadline or now > hard_deadline:
                             hb = eng._tok_host[MAXPOS + 4]
                             raise TimeoutError(
-                                f"decode produced {emitted + got}/{ntok} "
-                                f"tokens in {GEN_TIMEOUT:.0f}s; "
-                                f"heartbeat={hb}")
+                                f"decode stalled at {emitted + got}/"
+                                f"{ntok} tokens; heartbeat={hb}")
                         time.sleep(0.0005)
                 emitted += got
                 if eos or got < want:
@@ -477,8 +481,11 @@ def run_worker(model_name, host, port, tools_limit):
             log(f"ult-worker[{model_name}]: prompt={len(ids_in)}tok "
                 f"gen<={ntok} stream={stream}")
 
-            if stream and not tools:
-                return self._stream(ids_in, ntok)
+            if stream:
+                # live-stream even with tools: raw text lands as it is
+                # generated (no 300s of silence), parsed tool_calls are
+                # appended as a proper delta at the end
+                return self._stream(ids_in, ntok, tools_mode=bool(tools))
             try:
                 gen_ids = []
                 generate(ids_in, ntok, on_tok=gen_ids.extend)
@@ -501,8 +508,6 @@ def run_worker(model_name, host, port, tools_limit):
                     "usage": {"prompt_tokens": len(ids_in),
                               "completion_tokens": len(gen_ids),
                               "total_tokens": len(ids_in) + len(gen_ids)}}
-            if stream:
-                return self._stream_buffered(resp)
             return self._json(200, resp)
 
         def _stream_head(self):
@@ -514,8 +519,9 @@ def run_worker(model_name, host, port, tools_limit):
             self.end_headers()
             self._sse(self._chunk({"role": "assistant", "content": ""}))
 
-        def _stream(self, ids_in, ntok):
-            """Live SSE: decode-suffix deltas, think->reasoning split."""
+        def _stream(self, ids_in, ntok, tools_mode=False):
+            """Live SSE: decode-suffix deltas, think->reasoning split.
+            tools_mode: also emit parsed tool_calls at the end."""
             self._stream_head()
             state = {"ids": [], "think_done": False,
                      "sent_reason": 0, "sent_content": 0}
@@ -567,25 +573,17 @@ def run_worker(model_name, host, port, tools_limit):
             usage = {"prompt_tokens": len(ids_in),
                      "completion_tokens": n_gen,
                      "total_tokens": len(ids_in) + n_gen}
-            self._sse(self._chunk({}, finish="stop", usage=usage))
-            self._sse("[DONE]")
-
-        def _stream_buffered(self, resp):
-            """tools + stream: parse first, then emit buffered chunks."""
-            self._stream_head()
-            msg = resp["choices"][0]["message"]
-            if msg.get("reasoning_content"):
-                self._sse(self._chunk({"reasoning_content":
-                                       msg["reasoning_content"]}))
-            if msg.get("content"):
-                self._sse(self._chunk({"content": msg["content"]}))
-            for i, tc in enumerate(msg.get("tool_calls") or []):
-                tc["index"] = i
-                self._sse(self._chunk({"tool_calls": [tc]}))
-            self._sse(self._chunk({},
-                                  finish=resp["choices"][0]
-                                  ["finish_reason"],
-                                  usage=resp["usage"]))
+            finish = "stop"
+            if tools_mode and state["ids"]:
+                text = tok.decode(state["ids"], skip_special_tokens=True)
+                _, clean = split_think(text)
+                _, calls = split_tool_calls(clean)
+                if calls:
+                    finish = "tool_calls"
+                    for i, tc in enumerate(calls):
+                        tc["index"] = i
+                        self._sse(self._chunk({"tool_calls": [tc]}))
+            self._sse(self._chunk({}, finish=finish, usage=usage))
             self._sse("[DONE]")
 
     class QuietServer(ThreadingHTTPServer):

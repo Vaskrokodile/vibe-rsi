@@ -3,6 +3,10 @@ rem vibe-ult - launch the ULT engine server + xera-rsi harness in one go.
 rem Usage:  vibe-ult.cmd [xera-rsi args...]     (from anywhere)
 cd /d "%~dp0"
 
+rem cap generation: the kernel always emits all ntok slots, so a
+rem rambling turn costs ~ntok/decode-rate seconds under a busy GPU
+if "%ULT_MAX_GEN%"=="" set ULT_MAX_GEN=512
+
 rem reuse a live server if one is already bound — never two on :8321
 curl -s -m 2 http://127.0.0.1:8321/health >nul 2>&1
 if errorlevel 1 (
